@@ -1,1 +1,3 @@
 # rietveld-refinement
+
+author: @manuhergo
