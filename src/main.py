@@ -72,12 +72,7 @@ class ExperimentalModel(
         np.ndarray
     ):  # obtenemos los pesos como la inversa de la varianza da intensidad experimental y los metemos en un array
         i = self.intensities
-        n = len(i)
-        i_mean = sum(i) / n
-        var = 1 / n * np.sum((i - i_mean) ** 2)
-        weights = (
-            1 / var
-        )  # Mirar cómo usar esto como imput para otros métodos de otras clases
+        weights = np.where(i>0, 1.0/i, 0.0) # Si se cumple la condición, elemento = x. Si no, elemento = y
         return np.array(weights)
 
 
@@ -101,7 +96,7 @@ class TheoreticalModel(
         )  # Calcula el difractograma. Contiene la información de I y 2theta
         pattern = xrd_calc.get_pattern(structure)
 
-        return np.array(pattern.x, pattern.y)  # 2theta, intensidad
+        return pattern.x, pattern.y  # 2theta, intensidad
 
     def plot(self, label="Teórico"):
         # Usamos vlines (líneas verticales) para los picos
@@ -185,9 +180,29 @@ class TheoreticalModel(
             0  # Se empieza en 0 y el algoritmo los va cambiando para curvar la línea que modela el fondo
         )
 
+    def get_free_cell_parameters(self) -> list: #Determina qué parámetros de celda son independientes según la simetría.
+
+        # Usamos la estructura cargada en memoria por pymatgen
+        system = self.structure.lattice.crystal_system  
+        
+        mapping = {
+            "cubic": ["a"],
+            "tetragonal": ["a", "c"],
+            "hexagonal": ["a", "c"],
+            "trigonal": ["a", "c"],
+            "orthorhombic": ["a", "b", "c"],
+            "monoclinic": ["a", "b", "c", "beta"],
+            "triclinic": ["a", "b", "c", "alpha", "beta", "gamma"]
+        }
+        
+        return mapping.get(
+            system,
+            ["a", "c"] # Por defecto, tetragonal (Scheelite)
+            ) # Basta añadir el string sumándolo a p en el refine() para incluir estos parámetros en el refinamiento
+
     def set_active_parameters(
         self, active_params: list
-    ):  # Decide que parámetros se refinan en cada stage
+    ):  # Decide qué parámetros se refinan en cada stage
         self.active_params = active_params  # Llamaremos a este método desde refine, donde se establecerá qué parámetros deben estar activos
 
     def get_parameters(self):  # Empaqueta los parámetros activos
@@ -338,7 +353,7 @@ class MinimizationSolver:  # Construcción del algoritmo sin importar la física
                     lam * 10
                 )  # Nos estaríamos alejando del mínimo. Nos interesa que domine GD
 
-            return p
+        return p
 
     def solve_lm_equation(
         self, residuals, jacobian, weights, lambda_factor
@@ -351,8 +366,12 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
     def __init__(
         self, experimental_model=ExperimentalModel, theoretical_model=TheoreticalModel
     ):
-        self.exp_model = ExperimentalModel
-        self.theo_model = TheoreticalModel
+        self.exp_model = experimental_model
+        self.theo_model = theoretical_model
+
+    def calculate_scale(self):
+        scale = np.max(self.exp_model.intensities) / np.max(self.theo_model.intensities) # Calculamos la escala aquí para no mezclar clases
+        return scale
 
     def calculate_residuals(self, p):
         pass
@@ -365,28 +384,43 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
 
     def refine(self):  # manda a ejecutar el fit
 
-        # 1) Recibimos los datos iniciales
+        # 1) Obtenemos los pesos
         w = self.exp_model.get_weights()
-        i_exp = self.exp_model.int_extraction()
-        i_theo = self.theo_model.data_extraction()
-        scale = np.max(i_exp) / np.max(i_theo)
-        p_initial = self.theo_model.get_parameters()
-        p_initial[0] = scale
 
-        # 2) Llamamos a MinimizationSolver para que resuelva el algoritmo
+        # 2) Definimos las etapas
+        cell_params = self.theo_model.get_free_cell_parameters()
+        stages = [
+            ["scale", "b0", "b1", "b2", "b3"], 
+            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"], # Empezaré probando 4 coefs para el fondo. Lo suyo es entre 3 y 6
+            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"] + cell_params, 
+            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"] + cell_params + ["W"],
+            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"] + cell_params + ["W", "U", "V"], 
+            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"] + cell_params + ["W", "U", "V", "X", "Y"], 
+            # Revisar si hay un orden más robusto de refinamiento
+        ] # Para evitar que el programa se enfade conmigo, me voy a abstener de refinar más cosas por ahora xD
+
+        # 3) Llamamos al motor matemático como objeto
         optimizer = MinimizationSolver(
-            residual_function=self.calculate_residuals,
-            jacobian_function=self.calculate_jacobian,
+            residual_function = self.calculate_residuals,
+            jacobian_function = self.calculate_jacobian
         )
 
-        # 3) Actualizamos el vector de parámetros
-        p_final = optimizer.fit(p_initial, w)
+        # 4) Comenzamos a iterar
+        for active_params in stages:
+            # Activamos los parámetros
+            self.theo_model.set_active_parameters(active_params)
+            if "scale" in active_params and self.theo_model.scale == 1.0:
+                self.theo_model.scale = self.calculate_scale()
 
-        # 4) Guardamos los cambios en el modelo teórico, recuperando la física del problema
-        self.theo_model.update_parameters(p_final)
+            p_initial = self.theo_model.get_parameters()
 
-        # 5) Calculamos el R_wp
-        rwp_final = self.calculate_rwp(p_final)
+            # 5) Refinamos los parámetros activos en esta iteración
+            p_final = optimizer.fit(p_initial, w)
+
+            # 6) Actualizamos el modelo teórico con los parámeros refinados
+            self.theo_model.update_parameters(p_final)
+
+
 
 
 # Ahora hay que mostrarle al usuario todas las magnitudes físicas referentes a la muestra.
@@ -394,12 +428,8 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
 if __name__ == "__main__":
 
     # 1) Sacamos las herramientas
-    path_xrdml = (
-        r"/mnt/c/Users/Manu/Desktop/ICMS/XRD Analysis/NaLuW-8_10-80(0.05-100)sm.xrdml"
-    )
-    path_cif = r"/mnt/c/Users/Manu/Desktop/ICMS/cifs/Scheelite.cif"
-    exp_model = ExperimentalModel("xrdml")  # hay que meter aquí la URL o path del xrdml
-    theo_model = TheoreticalModel("cif")  # hay que meter aquí la URL o path del cif
+    exp_model = ExperimentalModel(r"/mnt/c/Users/Manu/Desktop/ICMS/XRD Analysis/NaLuW-8_10-80(0.05-100)sm.xrdml")  # hay que meter aquí la URL o path del xrdml
+    theo_model = TheoreticalModel(r"/mnt/c/Users/Manu/Desktop/ICMS/cifs/Scheelite.cif")  # hay que meter aquí la URL o path del cif
 
     # 2) Visualizamos las gráficas iniciales
     exp_model.plot(label="Experimental")
