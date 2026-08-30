@@ -1,0 +1,19 @@
+name: Code Style
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  format-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Run Black formatter
+        uses: psf/black@stable
+        with:
+          options: "--check --diff"
