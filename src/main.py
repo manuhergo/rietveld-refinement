@@ -1,7 +1,7 @@
 import numpy as np
+from numpy.polynomial.chebyshev import chebval
 import matplotlib.pyplot as plt
 from scm.plams import *  # source: https://www.scm.com/doc/PythonExamples/xrd/index.html
-
 from ase import Atoms
 from pymatgen.core.structure import Structure
 from pymatgen.analysis.diffraction.xrd import XRDCalculator
@@ -72,7 +72,9 @@ class ExperimentalModel(
         np.ndarray
     ):  # obtenemos los pesos como la inversa de la varianza da intensidad experimental y los metemos en un array
         i = self.intensities
-        weights = np.where(i>0, 1.0/i, 0.0) # Si se cumple la condición, elemento = x. Si no, elemento = y
+        weights = np.where(
+            i > 0, 1.0 / i, 0.0
+        )  # Si se cumple la condición, elemento = x. Si no, elemento = y
         return np.array(weights)
 
 
@@ -180,11 +182,15 @@ class TheoreticalModel(
             0  # Se empieza en 0 y el algoritmo los va cambiando para curvar la línea que modela el fondo
         )
 
-    def get_free_cell_parameters(self) -> list: #Determina qué parámetros de celda son independientes según la simetría.
+    def get_free_cell_parameters(
+        self,
+    ) -> (
+        list
+    ):  # Determina qué parámetros de celda son independientes según la simetría.
 
         # Usamos la estructura cargada en memoria por pymatgen
-        system = self.structure.lattice.crystal_system  
-        
+        system = self.structure.lattice.crystal_system
+
         mapping = {
             "cubic": ["a"],
             "tetragonal": ["a", "c"],
@@ -192,13 +198,12 @@ class TheoreticalModel(
             "trigonal": ["a", "c"],
             "orthorhombic": ["a", "b", "c"],
             "monoclinic": ["a", "b", "c", "beta"],
-            "triclinic": ["a", "b", "c", "alpha", "beta", "gamma"]
+            "triclinic": ["a", "b", "c", "alpha", "beta", "gamma"],
         }
-        
+
         return mapping.get(
-            system,
-            ["a", "c"] # Por defecto, tetragonal (Scheelite)
-            ) # Basta añadir el string sumándolo a p en el refine() para incluir estos parámetros en el refinamiento
+            system, ["a", "c"]  # Por defecto, tetragonal (Scheelite)
+        )  # Basta añadir el string sumándolo a p en el refine() para incluir estos parámetros en el refinamiento
 
     def set_active_parameters(
         self, active_params: list
@@ -301,8 +306,8 @@ class TheoreticalModel(
 
 class MinimizationSolver:  # Construcción del algoritmo sin importar la física que subyace
 
-    def __init__(self, residual_function, jacobian_function):
-        self.get_residuals = residual_function
+    def __init__(self, residuals_function, jacobian_function):
+        self.get_residuals = residuals_function
         self.get_jacobian = jacobian_function
         self.chi2_history = []
 
@@ -369,16 +374,125 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
         self.exp_model = experimental_model
         self.theo_model = theoretical_model
 
-    def calculate_scale(self):
-        scale = np.max(self.exp_model.intensities) / np.max(self.theo_model.intensities) # Calculamos la escala aquí para no mezclar clases
-        return scale
+    def calculate_scale(self) -> float:
+        self.scale = np.max(self.exp_model.intensities) / np.max(
+            self.theo_model.intensities
+        )  # Calculamos la escala aquí para no mezclar clases
+        return self.scale
 
-    def calculate_residuals(self, p):
-        pass
+    def calculate_background(self) -> np.ndarray:
+        # Calculamos la línea de background a través de los polinomios de Chebyshev, los cuales son estables en [-1, 1], por lo que debemos normalizar el 2theta primero
+        t_min = self.exp_model.two_theta[0]
+        t_max = self.exp_model.two_theta[-1]
+        x_norm = (2.0 * (self.exp_model.two_theta - t_min) / (t_max - t_min)) - 1.0
+        coeffs = [
+            getattr(self, self.theo_model.b0, 0.0),
+            getattr(self, self.theo_model.b1, 0.0),
+            getattr(self, self.theo_model.b2, 0.0),
+            getattr(self, self.theo_model.b3, 0.0),
+            getattr(self, self.theo_model.b4, 0.0),
+            getattr(self, self.theo_model.b5, 0.0),
+        ] # Como mucho habrá 6 coeficientes
+        return chebval(x_norm, coeffs)
 
-    def calculate_jacobian(self, p):
-        pass
+    def pseudo_voigt(self, delta: np.ndarray, H_G: float, H_L: float):
+        # delta es la distancia al centro del pico
+        # H_G y H_L son las FWHM de la gaussiana y la lorentziana respectivamente
+        
+        # Ancho total FWHM estimado (aproximación de Olivero-Longbothum)
+        H = (H_G**5 + 2.69269 * H_G**4 * H_L + 2.42843 * H_G**3 * H_L**2 + 
+             4.47163 * H_G**2 * H_L**3 + 0.07842 * H_G * H_L**4 + H_L**5) ** 0.2
 
+        if H <= 1e-6:
+            H = 1e-6 # Evitamos divergencia. Valores inferiores a 1e-6 favorecen que el programa explote
+
+        # Parámetro de mezcla eta. Dicta si domina la componente gaussiana o la lorentziana
+        eta = max(0.0, min(1.0, H_L / H))
+        
+        # Componente Gaussiana
+        g_factor = 4.0 * np.log(2)
+        G = (2.0 / H) * np.sqrt(np.log(2) / np.pi) * np.exp(-g_factor * (delta / H) ** 2)
+        
+        # Componente Lorentziana
+        L = (2.0 / (np.pi * H)) * (1.0 / (1.0 + 4.0 * (delta / H) ** 2))
+
+        # Función de pseudo - Voigt
+        p_voigt = eta * L + (1.0 - eta) * G
+        return p_voigt
+    
+    def calculate_i_calc(self) -> np.ndarray:
+        # Genera el difractograma teórico continuo
+        two_theta_exp = self.exp_model.two_theta
+        i_calc = self.calculate_background(two_theta_exp)
+        
+        # Obtener posiciones e intensidades discretas de Bragg del CIF
+        two_theta_bragg, i_bragg = self.theo_model.data_extraction()
+        
+        # Parámetros de perfil del modelo
+        scale = self.theo_model.scale
+        zero_shift = self.theo_model.two_theta_zero
+        U, V, W = self.theo_model.U, self.theo_model.V, self.theo_model.W
+        X, Y = self.theo_model.X, self.theo_model.Y
+        
+        # Sumar la contribución de cada pico de Bragg
+        for t_k, intensity in zip(two_theta_bragg, i_bragg):
+            # Aplicar corrección de cero angular
+            t_k_corr = t_k + zero_shift
+            
+            # Convertir theta a radianes para las funciones trigonométricas de Caglioti
+            theta_rad = np.radians(t_k_corr / 2.0)
+            tan_th = np.tan(theta_rad)
+            cos_th = np.cos(theta_rad)
+            
+            # Ancho Gaussiano (Caglioti)
+            H_G2 = U * (tan_th**2) + V * tan_th + W
+            H_G = np.sqrt(max(1e-6, H_G2))
+            
+            # Ancho Lorentziano
+            H_L = max(1e-6, X * tan_th + (Y / cos_th if cos_th != 0 else 0))
+            
+            # Ventana de corte para no evaluar puntos lejanos innecesariamente (radio = 5*H)
+            delta = two_theta_exp - t_k_corr
+            cutoff = 5.0 * (H_G + H_L)
+            mask = np.abs(delta) <= cutoff
+            
+            if np.any(mask):
+                profile = self.pseudo_voigt(delta[mask], H_G, H_L)
+                i_calc[mask] += scale * intensity * profile #Sumamos el fondo a los picos de bragg modelados con pseudo voigt
+                
+        return i_calc
+
+    def calculate_residuals(self, p) -> np.ndarray:
+        # Los residuos son la diferencia entre la intensidad experimental y calculada punto a punto. Pero no vale la intensidad calculada del cif. 
+        # Debemos añadir la influencia del fondo, la escala, el error de cero...
+        self.theo_model.update_parameters(p) # Con esto se obtiene un i_calc nuevo en cada iteración, lo que genera residuos nuevos
+        i_exp = self.exp_model.intensities
+        i_calc = self.i_calc
+        residuals = i_exp - i_calc
+        return residuals
+
+    def calculate_jacobian(self, p) -> np.ndarray:
+
+        r0 = self.calculate_residuals(p) # Array con las funciones que tenemos que derivar
+        N = len(r0) # Número de filas de la jacobiana = nº de funciones que hay que derivar
+        M = len(p) # Número de columnas de la jacobiana = nº de variables
+        J = np.zeros(N,M) # Definimos primero una matriz vacía y la vamos rellenando mediante iteraciones
+
+        for j in range (M):
+            p_perturbed = np.copy(p) # Reseteamos p en cada iteración para derivar respecto de una variable dejando el resto fijas
+
+            # Vamos a derivar mediante la definición. Para ello, debemos definir un paso lo suficientemente pequeño:
+            h = 1e-8*max(1, abs(p[j])) # Evito /0 y que el paso se acerque al límite de precisión del ordenador
+            p_perturbed[j] += h
+            res_perturbed = self.calculate_residuals(p_perturbed)
+
+            J[:, j] = (res_perturbed - r0) / h # Como no soy matemático esto es un límite con h --> 0
+
+        # Como calculate_residuals() necesita llamar a update_parameters(), esta sobreescribiendo theo_model con los parámetros perturbados. Debemos corregirlo
+        self.theo_model.update_parameters(p)
+
+        return J
+    
     def calculate_rwp(self, p):
         pass
 
@@ -390,19 +504,30 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
         # 2) Definimos las etapas
         cell_params = self.theo_model.get_free_cell_parameters()
         stages = [
-            ["scale", "b0", "b1", "b2", "b3"], 
-            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"], # Empezaré probando 4 coefs para el fondo. Lo suyo es entre 3 y 6
-            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"] + cell_params, 
+            ["scale", "b0", "b1", "b2", "b3"],
+            [
+                "scale",
+                "b0",
+                "b1",
+                "b2",
+                "b3",
+                "two_theta_zero",
+            ],  # Empezaré probando 4 coefs para el fondo. Lo suyo es entre 3 y 6
+            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"] + cell_params,
             ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"] + cell_params + ["W"],
-            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"] + cell_params + ["W", "U", "V"], 
-            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"] + cell_params + ["W", "U", "V", "X", "Y"], 
-            # Revisar si hay un orden más robusto de refinamiento
-        ] # Para evitar que el programa se enfade conmigo, me voy a abstener de refinar más cosas por ahora xD
+            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"]
+            + cell_params
+            + ["W", "U", "V"],
+            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"]
+            + cell_params
+            + ["W", "U", "V", "X", "Y"],
+            
+        ]  # Para evitar que el programa se enfade conmigo, me voy a abstener de refinar más cosas por ahora xD
 
         # 3) Llamamos al motor matemático como objeto
         optimizer = MinimizationSolver(
-            residual_function = self.calculate_residuals,
-            jacobian_function = self.calculate_jacobian
+            residuals_function=self.calculate_residuals,
+            jacobian_function=self.calculate_jacobian,
         )
 
         # 4) Comenzamos a iterar
@@ -421,15 +546,17 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
             self.theo_model.update_parameters(p_final)
 
 
-
-
 # Ahora hay que mostrarle al usuario todas las magnitudes físicas referentes a la muestra.
 
 if __name__ == "__main__":
 
     # 1) Sacamos las herramientas
-    exp_model = ExperimentalModel(r"/mnt/c/Users/Manu/Desktop/ICMS/XRD Analysis/NaLuW-8_10-80(0.05-100)sm.xrdml")  # hay que meter aquí la URL o path del xrdml
-    theo_model = TheoreticalModel(r"/mnt/c/Users/Manu/Desktop/ICMS/cifs/Scheelite.cif")  # hay que meter aquí la URL o path del cif
+    exp_model = ExperimentalModel(
+        r"/mnt/c/Users/Manu/Desktop/ICMS/XRD Analysis/NaLuW-8_10-80(0.05-100)sm.xrdml"
+    )  # hay que meter aquí la URL o path del xrdml
+    theo_model = TheoreticalModel(
+        r"/mnt/c/Users/Manu/Desktop/ICMS/cifs/Scheelite.cif"
+    )  # hay que meter aquí la URL o path del cif
 
     # 2) Visualizamos las gráficas iniciales
     exp_model.plot(label="Experimental")
