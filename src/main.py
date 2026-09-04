@@ -3,8 +3,9 @@ from numpy.polynomial.chebyshev import chebval
 import matplotlib.pyplot as plt
 from scm.plams import *  # source: https://www.scm.com/doc/PythonExamples/xrd/index.html
 from ase import Atoms
-from pymatgen.core.structure import Structure
+from pymatgen.core.structure import Structure, Lattice
 from pymatgen.analysis.diffraction.xrd import XRDCalculator
+from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
 
 class Model:
@@ -15,14 +16,14 @@ class Model:
     def plot(self, label=""):
         # Normalizamos la intensidad a 100 para que encaje con la teórica
         intensity_norm = (self.intensities / np.max(self.intensities)) * 100
-        plt.plot(self.two_theta, intensity_norm)
+        plt.plot(self.two_theta, intensity_norm, label=label)
         plt.xlabel("2θ")
         plt.ylabel("Intensidad Relativa (%)")
 
 
 class ExperimentalModel(
     Model
-):  # Contiene los datos del modelo experimental y calcula lo que depende de
+):  # Contiene los datos del modelo experimental y calcula lo que depende del mismo
 
     def __init__(self, xrdml: str):  # se activa recibiendo un archivo .xrdml
 
@@ -86,17 +87,17 @@ class TheoreticalModel(
         self.cif = cif
         self.active_params = ["scale"]
         self.set_starting_parameters()
-
-        super().__init__()
-        self.two_theta, self.intensities = self.data_extraction()
-
-    def data_extraction(self):
-
-        structure = Structure.from_file(self.cif)
-        xrd_calc = XRDCalculator(
+        self.xrd_calc = XRDCalculator(
             wavelength="CuKa"
         )  # Calcula el difractograma. Contiene la información de I y 2theta
-        pattern = xrd_calc.get_pattern(structure)
+
+        super().__init__()
+        self.two_theta, self.intensities = self.get_bragg_peaks()
+
+    def get_bragg_peaks(self):
+
+        self.structure = Structure.from_file(self.cif)
+        pattern = self.xrd_calc.get_pattern(self.structure)
 
         return pattern.x, pattern.y  # 2theta, intensidad
 
@@ -117,7 +118,7 @@ class TheoreticalModel(
                 if "_cell_length_b" in line:
                     self.b = float(line.split("b")[1].split("(")[0])
                 if "_cell_length_c" in line:
-                    self.c = float(line.split("c")[1].split("(")[0])
+                    self.c = float(line.split("th_c")[1].split("(")[0])
                 if "_cell_angle_alpha" in line:
                     self.alpha = float(line.split("alpha")[1].split("(")[0])
                 if "_cell_angle_beta" in line:
@@ -131,8 +132,7 @@ class TheoreticalModel(
                 if reading_info:
                     if "loop_" in line:
                         break
-                    else:
-                        info.append(line)
+                    info.append(line)
 
                 if (
                     "_atom_site_type_symbol" in line
@@ -163,17 +163,17 @@ class TheoreticalModel(
         # pero por ahora pondremos esto y actualizaremos el dato en RietveldSolver para no llamar métodos de ExperimentalModel en TheoreticalModel
 
         # 4) Error de cero angular y de la altura de la muestra
-        self.two_theta_zero = 0
+        self.two_theta_zero = 0.0
         self.s_d = (
             0  # Se pone a 0 por defecto y el refinamiento lo variará de ser necesario
         )
 
         # 5) Perfil de pico
-        self.U = 0
-        self.V = 0
+        self.U = 0.001
+        self.V = 0.001
         self.W = 0.01
-        self.X = 0
-        self.Y = 0
+        self.X = 0.001
+        self.Y = 0.001
         self.P_md = 1.0  # (Orientación preferente, March-Dollase)
 
         # 6) Coeficientes de Chebyshev. Como mucho se pueden tomar 6 para evitar overfitting.
@@ -188,8 +188,10 @@ class TheoreticalModel(
         list
     ):  # Determina qué parámetros de celda son independientes según la simetría.
 
-        # Usamos la estructura cargada en memoria por pymatgen
-        system = self.structure.lattice.crystal_system
+        sga = SpacegroupAnalyzer(self.structure)
+        self.system = (
+            sga.get_crystal_system()
+        )  # Devuelve la estructura ("cubic", "monoclinic", ...)
 
         mapping = {
             "cubic": ["a"],
@@ -202,7 +204,7 @@ class TheoreticalModel(
         }
 
         return mapping.get(
-            system, ["a", "c"]  # Por defecto, tetragonal (Scheelite)
+            self.system, ["a", "c"]  # Por defecto, tetragonal (Scheelite)
         )  # Basta añadir el string sumándolo a p en el refine() para incluir estos parámetros en el refinamiento
 
     def set_active_parameters(
@@ -227,6 +229,36 @@ class TheoreticalModel(
             magnitudes.append(
                 name
             )  # vector con todos los parámetros actualizados. Guarda los nombres físicos de las variables.
+
+        system = self.system.lower()  # Pone todo en minúsculas por si las moscas
+        if system == "tetragonal":
+            self.b = (
+                self.a
+            )  # Para que el programa te devuelva el b refinado y no el del cif.
+        elif system == "cubic":
+            self.b = self.a
+            self.c = self.a
+        elif system in ["hexagonal", "trigonal"]:
+            self.b = self.a
+
+        # Comprobamos si se está refinando algún parámetro de red. En caso afirmativo, actualizamos la estructura para que el programa no coja los parámetros
+        # de red iniciales.
+        lattice_params = ["a", "b", "c", "alpha", "beta", "gamma"]
+        if any(param in self.active_params for param in lattice_params):
+
+            # 1) Crear red
+            new_lattice = Lattice.from_parameters(
+                self.a, self.b, self.c, self.alpha, self.beta, self.gamma
+            )
+            # 2) Reemplazar estructura
+            self.structure = Structure(
+                new_lattice, self.structure.species, self.structure.frac_coords
+            )
+            # 3) Recalculamos los picos de Bragg con la nueva celda
+            pattern = self.xrd_calc.get_pattern(self.structure)
+            self.two_theta = pattern.x
+            self.intensities = pattern.y
+
         return np.array(magnitudes)
 
     def calc_cell_volume(self) -> float:
@@ -253,13 +285,13 @@ class TheoreticalModel(
         # Se obtiene a partir de la ecuación de Scherrer
         K = 0.9  # Asumimos partículas esferoidales, que son las que nos interesan.
         lambda_cu = 1.5406
-        if self.X <= 0:
-            self.crystal_size = 0
-            return 0.0
-        X = (
-            self.X
+
+        if abs(self.Y) < 1e-6:
+            return float("inf")  # Tamaño infinito si no hay ensanchamiento
+        Y = (
+            self.Y
         )  # Cuando invoquemos calc_crystal_size, ya se habrá refinado el modelo, luego en memoria estará el parámetro refinado
-        self.crystal_size = K * lambda_cu / (X * np.pi / 180)  # Scherrer
+        self.crystal_size = K * lambda_cu / (Y * np.pi / 180)  # Scherrer
         return self.crystal_size
 
     def calc_microstrain(self) -> float:
@@ -283,19 +315,19 @@ class TheoreticalModel(
             "alpha": "Ángulo α (deg)",
             "beta": "Ángulo β (deg)",
             "gamma": "Ángulo γ (deg)",
-            "volume": "Volumen de celda (Å³)",
+            "cell_volume": "Volumen de celda (Å³)",
             "crystal_size": "Tamaño del cristal (Å)",
             "microstrain": "Microdeformación",
         }
         # Añadimos las propiedades de cada átomo a report_names:
-        i = 1
-        while hasattr(self, f"sof_{i}"):
-            report_names[f"sof_{i}"] = f"SOF del átomo {i}"
-            report_names[f"x_{i}"] = f"coordenada x del átomo {i}"
-            report_names[f"y_{i}"] = f"coordenada y del átomo {i}"
-            report_names[f"z_{i}"] = f"coordenada z del átomo {i}"
-            report_names[f"u_iso_{i}"] = f"Desplazamiento U_iso del átomo {i}"
-            i = i + 1
+        # i = 1
+        # while hasattr(self, f"sof_{i}"):
+        # report_names[f"sof_{i}"] = f"SOF del átomo {i}"
+        # report_names[f"x_{i}"] = f"coordenada x del átomo {i}"
+        # report_names[f"y_{i}"] = f"coordenada y del átomo {i}"
+        # report_names[f"z_{i}"] = f"coordenada z del átomo {i}"
+        # report_names[f"u_iso_{i}"] = f"Desplazamiento U_iso del átomo {i}"
+        # i = i + 1
 
         report = {}
         for var, name in report_names.items():
@@ -361,9 +393,25 @@ class MinimizationSolver:  # Construcción del algoritmo sin importar la física
         return p
 
     def solve_lm_equation(
-        self, residuals, jacobian, weights, lambda_factor
+        self, res: np.ndarray, J: np.ndarray, w: np.ndarray, lam: float
     ) -> np.ndarray:
-        pass
+        w_sqrt = np.sqrt(w)
+        wJ = w_sqrt[:, np.newaxis] * J
+        wres = w_sqrt * res
+
+        GN_factor = (
+            wJ.T @ wJ
+        )  # @ hace la multiplicación matricial, no elemento a elemento
+        GD_factor = np.diag(
+            np.diag(GN_factor)
+        )  # Un diag crea un vector 1D. Con dos, formo la matriz diagonal
+        res_factor = wJ.T @ wres
+
+        delta_p = np.linalg.solve(
+            GN_factor + lam * GD_factor, -res_factor
+        )  # Ecuación de Levenberg-Marquardt
+
+        return delta_p
 
 
 class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietveld específicamente
@@ -375,24 +423,21 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
         self.theo_model = theoretical_model
 
     def calculate_scale(self) -> float:
-        self.scale = np.max(self.exp_model.intensities) / np.max(
-            self.theo_model.intensities
-        )  # Calculamos la escala aquí para no mezclar clases
-        return self.scale
+        i_calc_unscaled = self.calculate_i_calc()
+        self.theo_model.scale = np.max(self.exp_model.intensities) / np.max(
+            i_calc_unscaled
+        )
+        return self.theo_model.scale
 
-    def calculate_background(self) -> np.ndarray:
+    def calculate_background(self, two_theta: np.ndarray) -> np.ndarray:
         # Calculamos la línea de background a través de los polinomios de Chebyshev, los cuales son estables en [-1, 1], por lo que debemos normalizar el 2theta primero
         t_min = self.exp_model.two_theta[0]
         t_max = self.exp_model.two_theta[-1]
         x_norm = (2.0 * (self.exp_model.two_theta - t_min) / (t_max - t_min)) - 1.0
+
         coeffs = [
-            getattr(self, self.theo_model.b0, 0.0),
-            getattr(self, self.theo_model.b1, 0.0),
-            getattr(self, self.theo_model.b2, 0.0),
-            getattr(self, self.theo_model.b3, 0.0),
-            getattr(self, self.theo_model.b4, 0.0),
-            getattr(self, self.theo_model.b5, 0.0),
-        ]  # Como mucho habrá 6 coeficientes
+            getattr(self.theo_model, f"b{i}", 0.0) for i in range(6)
+        ]  # Genera dinámicamente ['b0', 'b1', ..., 'b5'] y busca en theo_model
         return chebval(x_norm, coeffs)
 
     def pseudo_voigt(self, delta: np.ndarray, H_G: float, H_L: float):
@@ -436,7 +481,8 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
         i_calc = self.calculate_background(two_theta_exp)
 
         # Obtener posiciones e intensidades discretas de Bragg del CIF
-        two_theta_bragg, i_bragg = self.theo_model.data_extraction()
+        two_theta_bragg = self.theo_model.two_theta
+        i_bragg = self.theo_model.intensities
 
         # Parámetros de perfil del modelo
         scale = self.theo_model.scale
@@ -481,7 +527,7 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
             p
         )  # Con esto se obtiene un i_calc nuevo en cada iteración, lo que genera residuos nuevos
         i_exp = self.exp_model.intensities
-        i_calc = self.i_calc
+        i_calc = self.calculate_i_calc()
         residuals = i_exp - i_calc
         return residuals
 
@@ -495,7 +541,7 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
         )  # Número de filas de la jacobiana = nº de funciones que hay que derivar
         M = len(p)  # Número de columnas de la jacobiana = nº de variables
         J = np.zeros(
-            N, M
+            (N, M)
         )  # Definimos primero una matriz vacía y la vamos rellenando mediante iteraciones
 
         for j in range(M):
@@ -519,8 +565,30 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
 
         return J
 
-    def calculate_rwp(self, p):
-        pass
+    def calculate_agreement_factors(
+        self,
+        i_exp: np.ndarray,
+        i_calc: np.ndarray,
+        w: np.ndarray,
+        num_active_params: int,
+    ) -> dict:
+        # Numerador de minimización y denominador de normalización
+        numerator = np.sum(w * (i_exp - i_calc) ** 2)
+        denominator = np.sum(w * i_exp**2)
+
+        # 1. R_wp (Weighted Profile)
+        r_wp = np.sqrt(numerator / denominator)
+
+        # 2. R_exp (Expected R-factor)
+        N = len(i_exp)  # Total de puntos del difractograma
+        P = num_active_params  # Grados de libertad consumidos
+        r_exp = np.sqrt((N - P) / denominator)
+
+        # 3. Goodness of Fit (Chi-cuadrado reducido)
+        chi2 = (r_wp / r_exp) ** 2
+
+        # Devolvemos R_wp y R_exp en formato porcentaje por convención cristalográfica
+        return {"R_wp": r_wp * 100, "R_exp": r_exp * 100, "Chi2": chi2}
 
     def refine(self):  # manda a ejecutar el fit
 
@@ -569,6 +637,45 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
 
             # 6) Actualizamos el modelo teórico con los parámeros refinados
             self.theo_model.update_parameters(p_final)
+            i_calc_final = self.calculate_i_calc()
+
+            # 7) Comprobamos la evolución de los indicadores
+            factors = self.calculate_agreement_factors(
+                self.exp_model.intensities, i_calc_final, w, len(active_params)
+            )
+
+            # Mostramos el resultado de la etapa por pantalla
+            print(f"Fin de la etapa. Parámetros activos: {len(active_params)}")
+            print(
+                f"Rwp: {factors['R_wp']:.2f}% | Rexp: {factors['R_exp']:.2f}% | Chi2: {factors['Chi2']:.2f}\n"
+            )
+
+    def plot_refinement(self):
+        x = self.exp_model.two_theta
+        y_exp = self.exp_model.intensities
+        y_calc = self.calculate_i_calc()
+        dif = y_exp - y_calc
+        plt.figure(figsize=(6, 10))
+
+        # 1) Curvas experimental y calculada
+        plt.plot(x, y_exp, "o", markersize=2, color="black", label="Experimental")
+        plt.plot(x, y_calc, "-", color="red", linewidth=1.5, label="Calculada")
+
+        # 2) Curva de diferencia
+        offset = (
+            -np.max(y_exp) * 0.1
+        )  # Baja un poco la curva de diferencia para que no se confunda con el fondo
+        plt.plot(x, dif + offset, "-", color="blue", linewidth=1, label="Diferencia")
+
+        # 3) Línea de referencia para la diferencia
+        plt.axhline(offset, color="gray", linestyle="--", linewidth=0.5)
+
+        plt.xlabel("2θ (grados)")
+        plt.ylabel("Intensidad")
+        plt.title("Resultado del Refinamiento Rietveld")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
 
 
 # Ahora hay que mostrarle al usuario todas las magnitudes físicas referentes a la muestra.
@@ -577,7 +684,7 @@ if __name__ == "__main__":
 
     # 1) Sacamos las herramientas
     exp_model = ExperimentalModel(
-        r"/mnt/c/Users/Manu/Desktop/ICMS/XRD Analysis/NaLuW-8_10-80(0.05-100)sm.xrdml"
+        r"/mnt/c/Users/Manu/Desktop/ICMS/XRD Analysis/NaLuW-13_10-80(0.05-100)sm.xrdml"
     )  # hay que meter aquí la URL o path del xrdml
     theo_model = TheoreticalModel(
         r"/mnt/c/Users/Manu/Desktop/ICMS/cifs/Scheelite.cif"
@@ -595,7 +702,10 @@ if __name__ == "__main__":
     # 4) Empaquetamos el resultado
     sample_cif = theo_model.get_physical_report()
 
-    # 5) Imprimimos los resultados de forma limpia
+    # 5) Plotamos la curva refinada
+    refinement.plot_refinement()
+
+    # 6) Imprimimos los resultados de forma limpia
     print("\n--- RESULTADOS DEL REFINAMIENTO ---")
     for magnitude, value in sample_cif.items():
         print(f"{magnitude} = {value:.4f}")
