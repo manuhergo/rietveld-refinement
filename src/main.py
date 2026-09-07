@@ -41,7 +41,7 @@ class ExperimentalModel(
                     line = line.split(">", 1)[1]
                     line = line.split("</")[0]
                     values = line.split()
-                    values = [int(value) for value in values]
+                    values = [float(value) for value in values]
                     intensities.extend(values)
         return np.array(intensities)
 
@@ -87,9 +87,18 @@ class TheoreticalModel(
         self.cif = cif
         self.active_params = ["scale"]
         self.set_starting_parameters()
-        self.xrd_calc = XRDCalculator(
+        self.wavelength = self.xrd_calc = XRDCalculator(
             wavelength="CuKa"
-        )  # Calcula el difractograma. Contiene la información de I y 2theta
+        )
+        
+        self.bounds = {
+            "B_overall": (0.1, 3.0),
+            "U": (0.0, 0.02),
+            "W": (1e-6, None),
+            "X": (0.0, 0.05),
+            "Y": (0.001, 0.5),
+            "MD_r": (0.1, 5.0)
+        }
 
         super().__init__()
         self.two_theta, self.intensities = self.get_bragg_peaks()
@@ -98,6 +107,7 @@ class TheoreticalModel(
 
         self.structure = Structure.from_file(self.cif)
         pattern = self.xrd_calc.get_pattern(self.structure)
+        self.hkl = [[equiv['hkl'] for equiv in reflexion] for reflexion in pattern.hkls]
 
         return pattern.x, pattern.y  # 2theta, intensidad
 
@@ -139,18 +149,18 @@ class TheoreticalModel(
                 ):  # Si alguna vez refinas algo que no sea scheelite, revisa el cif y que la línea sea esa
                     reading_info = True
 
-            for i in range(1, min(len(info), 4)):
-                atom_i = info[i].split()
-                sof = float(atom_i[1].split("(")[0])  # SOF = Factor de ocupación
-                x = float(atom_i[2].split("(")[0])
-                y = float(atom_i[3].split("(")[0])
-                z = float(atom_i[4].split("(")[0])
-                u_iso = float(atom_i[6].split("(")[0])  # U_iso or equivalent
-                setattr(self, f"sof_{i}", sof)
-                setattr(self, f"x_{i}", x)
-                setattr(self, f"y_{i}", y)
-                setattr(self, f"z_{i}", z)
-                setattr(self, f"u_iso_{i}", u_iso)
+            # for i in range(1, min(len(info), 4)):
+            # atom_i = info[i].split()
+            # sof = float(atom_i[1].split("(")[0])  # SOF = Factor de ocupación
+            # x = float(atom_i[2].split("(")[0])
+            # y = float(atom_i[3].split("(")[0])
+            # z = float(atom_i[4].split("(")[0])
+            # u_iso = float(atom_i[6].split("(")[0])  # U_iso or equivalent
+            # setattr(self, f"sof_{i}", sof)
+            # setattr(self, f"x_{i}", x)
+            # setattr(self, f"y_{i}", y)
+            # setattr(self, f"z_{i}", z)
+            # setattr(self, f"u_iso_{i}", u_iso)
 
         # Estos son todos los parámetros refinables que podemos extraer del CIF
         # Vamos ahora a obtener los que no se pueden extraer del CIF
@@ -164,23 +174,36 @@ class TheoreticalModel(
 
         # 4) Error de cero angular y de la altura de la muestra
         self.two_theta_zero = 0.0
-        self.s_d = (
-            0  # Se pone a 0 por defecto y el refinamiento lo variará de ser necesario
-        )
+        self.sample_displacement = 0.0
 
         # 5) Perfil de pico
         self.U = 0.001
-        self.V = 0.001
+        self.V = 0.0
         self.W = 0.01
         self.X = 0.001
         self.Y = 0.001
-        self.P_md = 1.0  # (Orientación preferente, March-Dollase)
+        self.MD_r = 1.0  # (Orientación preferente, March-Dollase)
 
         # 6) Coeficientes de Chebyshev. Como mucho se pueden tomar 6 para evitar overfitting.
         self.b0 = 100  # se suele tomar min(I_exp). También actualizaremos este parámetro en RietveldSolver
         self.b1 = self.b2 = self.b3 = self.b4 = self.b5 = (
             0  # Se empieza en 0 y el algoritmo los va cambiando para curvar la línea que modela el fondo
         )
+
+        # 7) Fondo de aire.
+        self.B_air = 100.0
+
+        # 8) Constante de Debye-Waller.
+        self.B_overall = 0.75
+
+    def calc_march_dollase(self, cos_alpha: float, r: float) -> float:
+        # Blindaje contra valores r negativos o cero
+        r_safe = np.maximum(r, 1e-4) 
+        cos_sq = cos_alpha**2
+        sin_sq = 1 - cos_sq
+        
+        term = (r_safe**2 * cos_sq) + ((1.0 / r_safe) * sin_sq)
+        return term**(-1.5)
 
     def get_free_cell_parameters(
         self,
@@ -222,9 +245,16 @@ class TheoreticalModel(
 
     def update_parameters(self, p: np.ndarray) -> np.ndarray:
         # desempaqueta los números sin física que devuelve cada iteración y les dota de sentido
-        # ejemplo: self.a = p[0]... y así según el orden que yo le ponga a los elementos de p
+
         magnitudes = []
         for name, value in zip(self.active_params, p):
+            # Si el parámetro tiene límites definidos, recortamos el valor numérico
+            if name in self.bounds:
+                low, high = self.bounds[name]
+                if low is not None:
+                    value = max(low, value)
+                if high is not None:
+                    value = min(high, value)
             setattr(self, name, value)
             magnitudes.append(
                 name
@@ -238,8 +268,20 @@ class TheoreticalModel(
         elif system == "cubic":
             self.b = self.a
             self.c = self.a
-        elif system in ["hexagonal", "trigonal"]:
-            self.b = self.a
+        elif system in ["trigonal", "rhombohedral", "hexagonal"]:
+            # Detectamos si usa ejes hexagonales (gamma = 120)
+            if abs(self.gamma - 120.0) < 1.0:
+                # Aplica a Hexagonal puro o Romboédrico/Trigonal en ajuste hexagonal
+                self.b = self.a
+                self.alpha = 90.0
+                self.beta = 90.0
+                self.gamma = 120.0
+            else:
+                # Aplica a Romboédrico primitivo (a=b=c, alpha=beta=gamma)
+                self.b = self.a
+                self.c = self.a
+                self.beta = self.alpha
+                self.gamma = self.alpha
 
         # Comprobamos si se está refinando algún parámetro de red. En caso afirmativo, actualizamos la estructura para que el programa no coja los parámetros
         # de red iniciales.
@@ -295,11 +337,21 @@ class TheoreticalModel(
         return self.crystal_size
 
     def calc_microstrain(self) -> float:
-        if self.U <= 0:
-            self.microstrain = 0
-            return 0.0
-        sqrt_U = np.sqrt(self.U) * np.pi / 180
-        self.microstrain = sqrt_U
+        # 1. Contribución Gaussiana (U)
+        if self.U > 0:
+            strain_G = (np.sqrt(self.U) * np.pi / 180.0) / 4.0
+        else:
+            strain_G = 0.0
+
+        # 2. Contribución Lorentziana (X)
+        if self.X > 0:
+            strain_L = (self.X * np.pi / 180.0) / 4.0
+        else:
+            strain_L = 0.0
+
+        # 3. Deformación fraccional absoluta
+        self.microstrain = strain_G + strain_L
+
         return self.microstrain
 
     def get_physical_report(self) -> dict:
@@ -315,6 +367,7 @@ class TheoreticalModel(
             "alpha": "Ángulo α (deg)",
             "beta": "Ángulo β (deg)",
             "gamma": "Ángulo γ (deg)",
+            "MD_r": "Parámetro de MD",
             "cell_volume": "Volumen de celda (Å³)",
             "crystal_size": "Tamaño del cristal (Å)",
             "microstrain": "Microdeformación",
@@ -399,17 +452,17 @@ class MinimizationSolver:  # Construcción del algoritmo sin importar la física
         wJ = w_sqrt[:, np.newaxis] * J
         wres = w_sqrt * res
 
-        GN_factor = (
-            wJ.T @ wJ
-        )  # @ hace la multiplicación matricial, no elemento a elemento
-        GD_factor = np.diag(
-            np.diag(GN_factor)
-        )  # Un diag crea un vector 1D. Con dos, formo la matriz diagonal
+        GN_factor = wJ.T @ wJ
+        # @ hace la multiplicación matricial, no elemento a elemento
+        GD_factor = np.diag(np.diag(GN_factor))
+        # Un diag crea un vector 1D. Con dos, formo la matriz diagonal
+
+        eye = np.eye(GN_factor.shape[0])
+
         res_factor = wJ.T @ wres
 
-        delta_p = np.linalg.solve(
-            GN_factor + lam * GD_factor, -res_factor
-        )  # Ecuación de Levenberg-Marquardt
+        delta_p = np.linalg.solve(GN_factor + lam * GD_factor + 1e-8 * eye, -res_factor)
+        # Ecuación de Levenberg-Marquardt
 
         return delta_p
 
@@ -431,14 +484,25 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
 
     def calculate_background(self, two_theta: np.ndarray) -> np.ndarray:
         # Calculamos la línea de background a través de los polinomios de Chebyshev, los cuales son estables en [-1, 1], por lo que debemos normalizar el 2theta primero
+
+        # 1) Normalización de 2theta
         t_min = self.exp_model.two_theta[0]
         t_max = self.exp_model.two_theta[-1]
         x_norm = (2.0 * (self.exp_model.two_theta - t_min) / (t_max - t_min)) - 1.0
 
+        # 2) Extracción de los coeficientes
         coeffs = [
             getattr(self.theo_model, f"b{i}", 0.0) for i in range(6)
         ]  # Genera dinámicamente ['b0', 'b1', ..., 'b5'] y busca en theo_model
-        return chebval(x_norm, coeffs)
+
+        # 3) Cálculo de la base polinómica con chebval
+        bg = chebval(x_norm, coeffs)
+
+        # 4) Suma del término de dispersión de aire
+        b_air = getattr(self.theo_model, "B_air", 0.0)
+        bg += b_air / np.maximum(two_theta, 1e-4)
+
+        return bg
 
     def pseudo_voigt(self, delta: np.ndarray, H_G: float, H_L: float):
         # delta es la distancia al centro del pico
@@ -457,8 +521,12 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
         if H <= 1e-6:
             H = 1e-6  # Evitamos divergencia. Valores inferiores a 1e-6 favorecen que el programa explote
 
+        r = H_L / H  # Cociente entre ancho Lorentziano y total
+        # Polinomio de Thompson-Cox-Hastings para eta
+        eta_calc = 1.36603 * r - 0.47719 * (r**2) + 0.11116 * (r**3)
+
         # Parámetro de mezcla eta. Dicta si domina la componente gaussiana o la lorentziana
-        eta = max(0.0, min(1.0, H_L / H))
+        eta = max(0.0, min(1.0, eta_calc))
 
         # Componente Gaussiana
         g_factor = 4.0 * np.log(2)
@@ -483,17 +551,60 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
         # Obtener posiciones e intensidades discretas de Bragg del CIF
         two_theta_bragg = self.theo_model.two_theta
         i_bragg = self.theo_model.intensities
+        equiv_hkls = self.theo_model.hkl
 
-        # Parámetros de perfil del modelo
+        # Parámetros del modelo
         scale = self.theo_model.scale
+        B_overall = self.theo_model.B_overall
+        wavelength = 1.5406
         zero_shift = self.theo_model.two_theta_zero
+        sd = self.theo_model.sample_displacement
         U, V, W = self.theo_model.U, self.theo_model.V, self.theo_model.W
         X, Y = self.theo_model.X, self.theo_model.Y
 
+        # Parámetros adicionales
+        a_cell = self.theo_model.a
+        c_cell = self.theo_model.c
+        MD_r = self.theo_model.MD_r
+        H_pref, K_pref, L_pref = 1, 1, 2 # Pico con más cuentas
+
         # Sumar la contribución de cada pico de Bragg
-        for t_k, intensity in zip(two_theta_bragg, i_bragg):
+        for t_k, intensity, equiv_planes in zip(two_theta_bragg, i_bragg, equiv_hkls):
+
             # Aplicar corrección de cero angular
-            t_k_corr = t_k + zero_shift
+            theta_rad_k = np.radians(t_k / 2.0)
+
+            # Aplicar atenuación térmica a la intensidad base
+            dw_factor = np.exp(
+                -2.0 * B_overall * (np.sin(theta_rad_k) / wavelength) ** 2
+            )
+            corr_intensity = intensity * dw_factor
+
+            pk_sum = 0.0
+            # Iteramos sobre todos los planos que caen en este mismo ángulo
+            for h, k, l in equiv_planes:
+
+                # Cálculo exacto del ángulo para sistema Tetragonal
+                numerador = ((h * H_pref + k * K_pref) / a_cell**2) + ((l * L_pref) / c_cell**2)
+
+                denominador_1 = np.sqrt(((h**2 + k**2) / a_cell**2) + (l**2 / c_cell**2))
+                denominador_2 = np.sqrt(((H_pref**2 + K_pref**2) / a_cell**2) + (L_pref**2 / c_cell**2))
+
+                # Evitar divisiones por cero en el pico (0,0,0) si existiera
+                if denominador_1 > 0 and denominador_2 > 0:
+                    cos_alpha = numerador / (denominador_1 * denominador_2)
+                else:
+                    cos_alpha = 1.0
+
+                cos_alpha = np.clip(cos_alpha, -1.0, 1.0)
+                
+                # Factor March - Dollase:
+                pk_sum += self.theo_model.calc_march_dollase(cos_alpha, MD_r)
+            # Factor March - Dollase promediado en todos los planos equivalentes
+            Pk_avg = pk_sum / len(equiv_planes)
+
+            # Corregir aberraciones instrumentales
+            t_k_corr = t_k + zero_shift + sd * np.cos(theta_rad_k)
 
             # Convertir theta a radianes para las funciones trigonométricas de Caglioti
             theta_rad = np.radians(t_k_corr / 2.0)
@@ -515,7 +626,7 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
             if np.any(mask):
                 profile = self.pseudo_voigt(delta[mask], H_G, H_L)
                 i_calc[mask] += (
-                    scale * intensity * profile
+                    scale * (corr_intensity * Pk_avg) * profile
                 )  # Sumamos el fondo a los picos de bragg modelados con pseudo voigt
 
         return i_calc
@@ -545,20 +656,18 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
         )  # Definimos primero una matriz vacía y la vamos rellenando mediante iteraciones
 
         for j in range(M):
-            p_perturbed = np.copy(
-                p
-            )  # Reseteamos p en cada iteración para derivar respecto de una variable dejando el resto fijas
+            # Reseteamos p en cada iteración para derivar respecto de una variable dejando el resto fijas
+
+            p_perturbed = np.copy(p)
 
             # Vamos a derivar mediante la definición. Para ello, debemos definir un paso lo suficientemente pequeño:
-            h = 1e-8 * max(
-                1, abs(p[j])
-            )  # Evito /0 y que el paso se acerque al límite de precisión del ordenador
+            h = 1e-5 * max(1, abs(p[j]))
+            # Evito /0 y que el paso se acerque al límite de precisión del ordenador
             p_perturbed[j] += h
             res_perturbed = self.calculate_residuals(p_perturbed)
 
-            J[:, j] = (
-                res_perturbed - r0
-            ) / h  # Como no soy matemático esto es un límite con h --> 0
+            J[:, j] = (res_perturbed - r0) / h
+            # Como no soy matemático esto es un límite con h --> 0
 
         # Como calculate_residuals() necesita llamar a update_parameters(), está sobreescribiendo theo_model con los parámetros perturbados. Debemos corregirlo
         self.theo_model.update_parameters(p)
@@ -598,23 +707,22 @@ class RietveldSolver:  # Emplea el algoritmo para resolver el problema de Rietve
         # 2) Definimos las etapas
         cell_params = self.theo_model.get_free_cell_parameters()
         stages = [
-            ["scale", "b0", "b1", "b2", "b3"],
-            [
-                "scale",
-                "b0",
-                "b1",
-                "b2",
-                "b3",
-                "two_theta_zero",
-            ],  # Empezaré probando 4 coefs para el fondo. Lo suyo es entre 3 y 6
-            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"] + cell_params,
-            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"] + cell_params + ["W"],
-            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"]
+            ["scale", "b0", "b1", "b2", "b3", "b4", "b5", "B_air"],
+            ["scale", "b0", "b1", "b2", "b3", "b4", "b5", "B_air", "sample_displacement"],
+            ["scale", "b0", "b1", "b2", "b3", "b4", "b5", "B_air", "sample_displacement"]
+            + cell_params,
+            ["scale", "b0", "b1", "b2", "b3", "b4", "b5", "B_air", "sample_displacement"]
             + cell_params
-            + ["W", "U", "V"],
-            ["scale", "b0", "b1", "b2", "b3", "two_theta_zero"]
+            + ["B_overall", "MD_r"],
+            ["scale", "b0", "b1", "b2", "b3", "b4", "b5", "B_air", "sample_displacement"]
             + cell_params
-            + ["W", "U", "V", "X", "Y"],
+            + ["B_overall", "MD_r", "X", "Y"],
+            ["scale", "b0", "b1", "b2", "b3", "b4", "b5", "B_air", "sample_displacement"]
+            + cell_params
+            + ["B_overall", "MD_r", "X", "Y", "W"],
+            ["scale", "b0", "b1", "b2", "b3", "b4", "b5", "B_air", "sample_displacement"]
+            + cell_params
+            + ["B_overall", "MD_r", "X", "Y", "W", "U"],
         ]  # Para evitar que el programa se enfade conmigo, me voy a abstener de refinar más cosas por ahora xD
 
         # 3) Llamamos al motor matemático como objeto
@@ -684,7 +792,7 @@ if __name__ == "__main__":
 
     # 1) Sacamos las herramientas
     exp_model = ExperimentalModel(
-        r"/mnt/c/Users/Manu/Desktop/ICMS/XRD Analysis/NaLuW-13_10-80(0.05-100)sm.xrdml"
+        r"/mnt/c/Users/Manu/Desktop/ICMS/XRD Analysis/NGWO-5EU_10-90(0.02-100)m.xrdml"
     )  # hay que meter aquí la URL o path del xrdml
     theo_model = TheoreticalModel(
         r"/mnt/c/Users/Manu/Desktop/ICMS/cifs/Scheelite.cif"
