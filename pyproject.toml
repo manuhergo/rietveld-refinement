@@ -8,7 +8,12 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "ase>=3.29.0",
     "black>=26.5.1",
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.2",
+    "plams>=2026.104",
+    "pymatgen>=2026.5.4",
 ]
 
 [project.scripts]
